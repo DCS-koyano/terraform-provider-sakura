@@ -24,8 +24,8 @@ import (
 	eventbus_api "github.com/sacloud/eventbus-api-go/apis/v1"
 	saht "github.com/sacloud/go-http"
 	"github.com/sacloud/iaas-api-go"
-	"github.com/sacloud/iaas-api-go/helper/api"
 	"github.com/sacloud/iaas-api-go/helper/query"
+	"github.com/sacloud/iaas-api-go/trace"
 	kms "github.com/sacloud/kms-api-go"
 	kmsapi "github.com/sacloud/kms-api-go/apis/v1"
 	nosql "github.com/sacloud/nosql-api-go"
@@ -39,6 +39,7 @@ import (
 	"github.com/sacloud/simplemq-api-go"
 	"github.com/sacloud/simplemq-api-go/apis/v1/queue"
 	"github.com/sacloud/terraform-provider-sakura/internal/defaults"
+	"github.com/sacloud/terraform-provider-sakura/internal/legacybridge"
 	ver "github.com/sacloud/terraform-provider-sakura/version"
 )
 
@@ -80,6 +81,10 @@ type Config struct {
 	APIRequestTimeout   int
 	APIRequestRateLimit int
 	TerraformVersion    string
+
+	ServicePrincipalID             string
+	ServicePrincipalKeyID          string
+	ServicePrincipalPrivateKeyPath string
 }
 
 // APIClient for SakuraCloud API
@@ -155,6 +160,15 @@ func (c *Config) FillWith(other *Config) {
 	if c.APIRequestRateLimit == 0 && other.APIRequestRateLimit > 0 {
 		c.APIRequestRateLimit = other.APIRequestRateLimit
 	}
+	if c.ServicePrincipalID == "" {
+		c.ServicePrincipalID = other.ServicePrincipalID
+	}
+	if c.ServicePrincipalKeyID == "" {
+		c.ServicePrincipalKeyID = other.ServicePrincipalKeyID
+	}
+	if c.ServicePrincipalPrivateKeyPath == "" {
+		c.ServicePrincipalPrivateKeyPath = other.ServicePrincipalPrivateKeyPath
+	}
 }
 
 func (c *Config) FillWithDefault() {
@@ -209,12 +223,66 @@ func (c *Config) LoadFromProfile() (*Config, error) {
 }
 
 func (c *Config) validate() error {
-	var err error
-	if c.AccessToken == "" {
-		err = multierror.Append(err, errors.New("AccessToken is required"))
+	hasToken := c.AccessToken != ""
+	hasSecret := c.AccessTokenSecret != ""
+	apiKeyComplete := hasToken && hasSecret
+
+	hasSPID := c.ServicePrincipalID != ""
+	hasSPKeyID := c.ServicePrincipalKeyID != ""
+	hasSPKeyPath := c.ServicePrincipalPrivateKeyPath != ""
+	spComplete := hasSPID && hasSPKeyID && hasSPKeyPath
+
+	if apiKeyComplete || spComplete {
+		// At least one auth method is complete; check for partial config in the other
+		var err error
+		if !apiKeyComplete && (hasToken || hasSecret) {
+			if !hasToken {
+				err = multierror.Append(err, errors.New("AccessToken is set but AccessTokenSecret is missing"))
+			}
+			if !hasSecret {
+				err = multierror.Append(err, errors.New("AccessTokenSecret is set but AccessToken is missing"))
+			}
+		}
+		if !spComplete && (hasSPID || hasSPKeyID || hasSPKeyPath) {
+			if !hasSPID {
+				err = multierror.Append(err, errors.New("ServicePrincipalKeyID or ServicePrincipalPrivateKeyPath is set but ServicePrincipalID is missing"))
+			}
+			if !hasSPKeyID {
+				err = multierror.Append(err, errors.New("ServicePrincipalID or ServicePrincipalPrivateKeyPath is set but ServicePrincipalKeyID is missing"))
+			}
+			if !hasSPKeyPath {
+				err = multierror.Append(err, errors.New("ServicePrincipalID or ServicePrincipalKeyID is set but ServicePrincipalPrivateKeyPath is missing"))
+			}
+		}
+		return err
 	}
-	if c.AccessTokenSecret == "" {
-		err = multierror.Append(err, errors.New("AccessTokenSecret is required"))
+
+	// Neither is complete
+	var err error
+	if hasToken || hasSecret {
+		// Partial API key
+		if !hasToken {
+			err = multierror.Append(err, errors.New("AccessTokenSecret is set but AccessToken is missing"))
+		}
+		if !hasSecret {
+			err = multierror.Append(err, errors.New("AccessToken is set but AccessTokenSecret is missing"))
+		}
+	}
+	if hasSPID || hasSPKeyID || hasSPKeyPath {
+		// Partial SP
+		if !hasSPID {
+			err = multierror.Append(err, errors.New("ServicePrincipalKeyID or ServicePrincipalPrivateKeyPath is set but ServicePrincipalID is missing"))
+		}
+		if !hasSPKeyID {
+			err = multierror.Append(err, errors.New("ServicePrincipalID or ServicePrincipalPrivateKeyPath is set but ServicePrincipalKeyID is missing"))
+		}
+		if !hasSPKeyPath {
+			err = multierror.Append(err, errors.New("ServicePrincipalID or ServicePrincipalKeyID is set but ServicePrincipalPrivateKeyPath is missing"))
+		}
+	}
+	if err == nil {
+		// Nothing set at all
+		err = multierror.Append(err, errors.New("AccessToken/AccessTokenSecret or ServicePrincipal credentials are required"))
 	}
 	return err
 }
@@ -254,6 +322,39 @@ func (c *Config) NewClient(envConf *Config, theClient *saclient.Client) (*APICli
 			enableAPITrace = false
 		}
 	}
+
+	// saclient-go: Populate to finalize settings
+	if err := theClient.Populate(); err != nil {
+		return nil, fmt.Errorf("populating saclient: %w", err)
+	}
+
+	// IaaS: saclient-go native via NewClientFromSaclient
+	iaasClient := iaas.NewClientFromSaclient(theClient)
+
+	// IaaS global side-effects (matching helper/api.newCaller behavior)
+	if c.DefaultZone != "" {
+		iaas.APIDefaultZone = c.DefaultZone
+	}
+	if len(c.Zones) > 0 {
+		iaas.SakuraCloudZones = c.Zones
+	}
+	if c.APIRootURL != "" {
+		apiRoot := c.APIRootURL
+		if strings.HasSuffix(apiRoot, "/") {
+			apiRoot = strings.TrimRight(apiRoot, "/")
+		}
+		iaas.SakuraCloudAPIRoot = apiRoot
+	}
+	if enableAPITrace {
+		trace.AddClientFactoryHooks()
+	}
+
+	zones := c.Zones
+	if len(zones) == 0 {
+		zones = iaas.SakuraCloudZones
+	}
+
+	// EventBus: existing callerOptions (API key auth only, NOT bridged)
 	callerOptions := &client.Options{
 		AccessToken:          c.AccessToken,
 		AccessTokenSecret:    c.AccessTokenSecret,
@@ -266,39 +367,52 @@ func (c *Config) NewClient(envConf *Config, theClient *saclient.Client) (*APICli
 		UserAgent:            ua,
 		Trace:                enableHTTPTrace,
 	}
-	callerOptionsWithoutBigInt := &client.Options{
-		AccessToken:          c.AccessToken,
-		AccessTokenSecret:    c.AccessTokenSecret,
-		AcceptLanguage:       c.AcceptLanguage,
-		HttpRequestTimeout:   c.APIRequestTimeout,
-		HttpRequestRateLimit: c.APIRequestRateLimit,
-		RetryMax:             c.RetryMax,
-		RetryWaitMax:         c.RetryWaitMax,
-		RetryWaitMin:         c.RetryWaitMin,
-		UserAgent:            ua,
-		Trace:                enableHTTPTrace,
+
+	// Bridge for legacy SDKs (KMS, NoSQL, APIGW, ObjectStorage)
+	bridgeHTTPClient := legacybridge.NewHTTPClient(theClient)
+	bridgeCallerOptions := &client.Options{
+		HttpClient:        bridgeHTTPClient,
+		AccessToken:       "",
+		AccessTokenSecret: "",
+		RetryMax:          1, // 1 = no retry (0 resets to default 10)
+		UserAgent:         ua,
+		AcceptLanguage:    c.AcceptLanguage,
+	}
+	bridgeCallerOptionsWithoutBigInt := &client.Options{
+		HttpClient:        bridgeHTTPClient,
+		AccessToken:       "",
+		AccessTokenSecret: "",
+		RetryMax:          1,
+		UserAgent:         ua,
+		AcceptLanguage:    c.AcceptLanguage,
 		RequestCustomizers: []saht.RequestCustomizer{
 			func(req *http.Request) error {
 				req.Header.Set("X-Sakura-Bigint-As-Int", "0")
 				return nil
 			}},
 	}
-	caller := api.NewCallerWithOptions(&api.CallerOptions{
-		Options:     callerOptions,
-		APIRootURL:  c.APIRootURL,
-		DefaultZone: c.DefaultZone,
-		TraceAPI:    enableAPITrace,
-	})
 
-	zones := c.Zones
-	if len(zones) == 0 {
-		zones = iaas.SakuraCloudZones
-	}
-
-	kmsClient, err := kms.NewClient(client.WithOptions(callerOptions))
+	// Legacy SDKs: bridge
+	kmsClient, err := kms.NewClient(client.WithOptions(bridgeCallerOptions))
 	if err != nil {
 		return nil, err
 	}
+	nosqlClient, err := nosql.NewClient(client.WithOptions(bridgeCallerOptions))
+	if err != nil {
+		return nil, err
+	}
+	apigwClient, err := apigw.NewClient(client.WithOptions(bridgeCallerOptions))
+	if err != nil {
+		return nil, err
+	}
+
+	// EventBus: existing callerOptions (SP認証ブリッジの対象外)
+	eventbusClient, err := eventbus.NewClient(client.WithOptions(callerOptions))
+	if err != nil {
+		return nil, err
+	}
+
+	// saclient-go native SDKs
 	smClient, err := sm.NewClient(theClient)
 	if err != nil {
 		return nil, err
@@ -307,19 +421,7 @@ func (c *Config) NewClient(envConf *Config, theClient *saclient.Client) (*APICli
 	if err != nil {
 		return nil, err
 	}
-	eventbusClient, err := eventbus.NewClient(client.WithOptions(callerOptions))
-	if err != nil {
-		return nil, err
-	}
-	nosqlClient, err := nosql.NewClient(client.WithOptions(callerOptions))
-	if err != nil {
-		return nil, err
-	}
 	dedicatedStorageClient, err := dedicatedstorage.NewClient(theClient)
-	if err != nil {
-		return nil, err
-	}
-	apigwClient, err := apigw.NewClient(client.WithOptions(callerOptions))
 	if err != nil {
 		return nil, err
 	}
@@ -329,25 +431,32 @@ func (c *Config) NewClient(envConf *Config, theClient *saclient.Client) (*APICli
 	}
 
 	return &APIClient{
-		APICaller:                        caller,
+		APICaller:                        iaasClient,
 		defaultZone:                      c.Zone,
 		zones:                            zones,
 		deletionWaiterTimeout:            deletionWaiterTimeout,
 		deletionWaiterPollingInterval:    deletionWaiterPollingInterval,
 		databaseWaitAfterCreateDuration:  databaseWaitAfterCreateDuration,
 		vpcRouterWaitAfterCreateDuration: vpcRouterWaitAfterCreateDuration,
-		CallerOptions:                    callerOptions,
+		CallerOptions:                    bridgeCallerOptions,
 		KmsClient:                        kmsClient,
 		SecretManagerClient:              smClient,
 		SimpleMqClient:                   simplemqClient,
 		EventBusClient:                   eventbusClient,
-		AppRunClient:                     &apprun.Client{Options: callerOptions},
-		ObjectStorageClient:              &objectstorage.Client{Options: callerOptionsWithoutBigInt},
+		AppRunClient:                     &apprun.Client{Saclient: theClient},
+		ObjectStorageClient:              &objectstorage.Client{Options: bridgeCallerOptionsWithoutBigInt},
 		NosqlClient:                      nosqlClient,
 		DedicatedStorageClient:           dedicatedStorageClient,
 		ApigwClient:                      apigwClient,
 		SecurityControlClient:            secconClient,
 	}, nil
+}
+
+// HasBothAuthMethods returns true when both API key and SP credentials are fully configured.
+func (c *Config) HasBothAuthMethods() bool {
+	apiKeyComplete := c.AccessToken != "" && c.AccessTokenSecret != ""
+	spComplete := c.ServicePrincipalID != "" && c.ServicePrincipalKeyID != "" && c.ServicePrincipalPrivateKeyPath != ""
+	return apiKeyComplete && spComplete
 }
 
 const tfUAEnvVar = "TF_APPEND_USER_AGENT"

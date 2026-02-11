@@ -14,6 +14,7 @@ import (
 	"github.com/sacloud/iaas-api-go"
 	"github.com/sacloud/terraform-provider-sakura/internal/common"
 	"github.com/sacloud/terraform-provider-sakura/internal/defaults"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -354,4 +355,98 @@ func TestConfig_NewClient_loadFromProfile(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestFillWith_SPFields(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		base     common.Config
+		other    common.Config
+		wantSPID string
+		wantKey  string
+		wantPath string
+	}{
+		{
+			name:     "empty base filled from other",
+			base:     common.Config{},
+			other:    common.Config{ServicePrincipalID: "sp-id", ServicePrincipalKeyID: "sp-key", ServicePrincipalPrivateKeyPath: "/key.pem"},
+			wantSPID: "sp-id",
+			wantKey:  "sp-key",
+			wantPath: "/key.pem",
+		},
+		{
+			name:     "base values not overridden",
+			base:     common.Config{ServicePrincipalID: "base-id", ServicePrincipalKeyID: "base-key", ServicePrincipalPrivateKeyPath: "/base.pem"},
+			other:    common.Config{ServicePrincipalID: "other-id", ServicePrincipalKeyID: "other-key", ServicePrincipalPrivateKeyPath: "/other.pem"},
+			wantSPID: "base-id",
+			wantKey:  "base-key",
+			wantPath: "/base.pem",
+		},
+		{
+			name:     "partial base filled partially",
+			base:     common.Config{ServicePrincipalID: "base-id"},
+			other:    common.Config{ServicePrincipalID: "other-id", ServicePrincipalKeyID: "other-key", ServicePrincipalPrivateKeyPath: "/other.pem"},
+			wantSPID: "base-id",
+			wantKey:  "other-key",
+			wantPath: "/other.pem",
+		},
+		{
+			name:     "both empty stays empty",
+			base:     common.Config{},
+			other:    common.Config{},
+			wantSPID: "",
+			wantKey:  "",
+			wantPath: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			tt.base.FillWith(&tt.other)
+			assert.Equal(t, tt.wantSPID, tt.base.ServicePrincipalID)
+			assert.Equal(t, tt.wantKey, tt.base.ServicePrincipalKeyID)
+			assert.Equal(t, tt.wantPath, tt.base.ServicePrincipalPrivateKeyPath)
+		})
+	}
+}
+
+func TestFillWith_BackwardCompatibility_APIKeyFields(t *testing.T) {
+	t.Parallel()
+
+	// Verify existing API key fields still work correctly after SP field additions
+	base := common.Config{
+		AccessToken: "my-token",
+	}
+	other := common.Config{
+		AccessToken:       "other-token",
+		AccessTokenSecret: "other-secret",
+		Zone:              "is1b",
+	}
+
+	base.FillWith(&other)
+
+	assert.Equal(t, "my-token", base.AccessToken, "base AccessToken must not be overridden")
+	assert.Equal(t, "other-secret", base.AccessTokenSecret, "empty AccessTokenSecret should be filled")
+	assert.Equal(t, "is1b", base.Zone, "empty Zone should be filled")
+	assert.Empty(t, base.ServicePrincipalID, "SP fields should remain empty when not set")
+}
+
+func TestFillWithDefault_DoesNotAffectSPFields(t *testing.T) {
+	t.Parallel()
+
+	cfg := common.Config{
+		ServicePrincipalID:             "sp-id",
+		ServicePrincipalKeyID:          "sp-key",
+		ServicePrincipalPrivateKeyPath: "/key.pem",
+	}
+	cfg.FillWithDefault()
+
+	assert.Equal(t, "sp-id", cfg.ServicePrincipalID, "FillWithDefault must not clear SP fields")
+	assert.Equal(t, "sp-key", cfg.ServicePrincipalKeyID)
+	assert.Equal(t, "/key.pem", cfg.ServicePrincipalPrivateKeyPath)
+	assert.Equal(t, defaults.Zone, cfg.Zone, "Zone should get default")
+	assert.Equal(t, defaults.RetryMax, cfg.RetryMax, "RetryMax should get default")
 }

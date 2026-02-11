@@ -5,8 +5,10 @@ package sakura
 
 import (
 	"context"
+	"os"
 
 	"github.com/hashicorp/terraform-plugin-framework-validators/int32validator"
+	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	"github.com/hashicorp/terraform-plugin-framework/provider"
 	"github.com/hashicorp/terraform-plugin-framework/provider/schema"
@@ -71,6 +73,10 @@ type sakuraProviderModel struct {
 	APIRequestTimeout   types.Int64  `tfsdk:"api_request_timeout"`
 	APIRequestRateLimit types.Int32  `tfsdk:"api_request_rate_limit"`
 	TraceMode           types.String `tfsdk:"trace"`
+
+	ServicePrincipalID             types.String `tfsdk:"service_principal_id"`
+	ServicePrincipalKeyID          types.String `tfsdk:"service_principal_key_id"`
+	ServicePrincipalPrivateKeyPath types.String `tfsdk:"service_principal_private_key_path"`
 }
 
 func New(version string) func() provider.Provider {
@@ -157,24 +163,40 @@ func (p *sakuraProvider) Schema(_ context.Context, _ provider.SchemaRequest, res
 				Optional:    true,
 				Description: "The flag to enable output trace log. It can also be sourced from the `SAKURA_TRACE`/`SAKURACLOUD_TRACE` environment variables, or via a shared credentials file if `profile` is specified",
 			},
+			"service_principal_id": schema.StringAttribute{
+				Optional:    true,
+				Description: "The Service Principal ID for authentication. It can also be sourced from the `SAKURA_SERVICE_PRINCIPAL_ID`/`SAKURACLOUD_SERVICE_PRINCIPAL_ID` environment variables",
+			},
+			"service_principal_key_id": schema.StringAttribute{
+				Optional:    true,
+				Description: "The Service Principal Key ID for authentication. It can also be sourced from the `SAKURA_SERVICE_PRINCIPAL_KEY_ID`/`SAKURACLOUD_SERVICE_PRINCIPAL_KEY_ID` environment variables",
+			},
+			"service_principal_private_key_path": schema.StringAttribute{
+				Optional:    true,
+				Sensitive:   true,
+				Description: "The path to the Service Principal private key file for authentication. It can also be sourced from the `SAKURA_PRIVATE_KEY_PATH`/`SAKURACLOUD_PRIVATE_KEY_PATH` environment variables",
+			},
 		},
 	}
 }
 
 func (p *sakuraProvider) Configure(ctx context.Context, req provider.ConfigureRequest, resp *provider.ConfigureResponse) {
 	envConf := &common.Config{
-		Profile:             envvar.StringFromEnvMulti([]string{"SAKURA_PROFILE", "SAKURACLOUD_PROFILE"}, ""),
-		AccessToken:         envvar.StringFromEnvMulti([]string{"SAKURA_ACCESS_TOKEN", "SAKURACLOUD_ACCESS_TOKEN"}, ""),
-		AccessTokenSecret:   envvar.StringFromEnvMulti([]string{"SAKURA_ACCESS_TOKEN_SECRET", "SAKURACLOUD_ACCESS_TOKEN_SECRET"}, ""),
-		Zone:                envvar.StringFromEnvMulti([]string{"SAKURA_ZONE", "SAKURACLOUD_ZONE"}, ""),
-		DefaultZone:         envvar.StringFromEnvMulti([]string{"SAKURA_DEFAULT_ZONE", "SAKURACLOUD_DEFAULT_ZONE"}, ""),
-		APIRootURL:          envvar.StringFromEnvMulti([]string{"SAKURA_API_ROOT_URL", "SAKURACLOUD_API_ROOT_URL"}, ""),
-		RetryMax:            envvar.IntFromEnvMulti([]string{"SAKURA_RETRY_MAX", "SAKURACLOUD_RETRY_MAX"}, 0),
-		RetryWaitMax:        envvar.IntFromEnvMulti([]string{"SAKURA_RETRY_WAIT_MAX", "SAKURACLOUD_RETRY_WAIT_MAX"}, 0),
-		RetryWaitMin:        envvar.IntFromEnvMulti([]string{"SAKURA_RETRY_WAIT_MIN", "SAKURACLOUD_RETRY_WAIT_MIN"}, 0),
-		APIRequestTimeout:   envvar.IntFromEnvMulti([]string{"SAKURA_API_REQUEST_TIMEOUT", "SAKURACLOUD_API_REQUEST_TIMEOUT"}, 0),
-		APIRequestRateLimit: envvar.IntFromEnvMulti([]string{"SAKURA_RATE_LIMIT", "SAKURACLOUD_RATE_LIMIT"}, 0),
-		Zones:               envvar.StringSliceFromEnvMulti([]string{"SAKURA_ZONES", "SAKURACLOUD_ZONES"}, nil),
+		Profile:                        envvar.StringFromEnvMulti([]string{"SAKURA_PROFILE", "SAKURACLOUD_PROFILE"}, ""),
+		AccessToken:                    envvar.StringFromEnvMulti([]string{"SAKURA_ACCESS_TOKEN", "SAKURACLOUD_ACCESS_TOKEN"}, ""),
+		AccessTokenSecret:              envvar.StringFromEnvMulti([]string{"SAKURA_ACCESS_TOKEN_SECRET", "SAKURACLOUD_ACCESS_TOKEN_SECRET"}, ""),
+		Zone:                           envvar.StringFromEnvMulti([]string{"SAKURA_ZONE", "SAKURACLOUD_ZONE"}, ""),
+		DefaultZone:                    envvar.StringFromEnvMulti([]string{"SAKURA_DEFAULT_ZONE", "SAKURACLOUD_DEFAULT_ZONE"}, ""),
+		APIRootURL:                     envvar.StringFromEnvMulti([]string{"SAKURA_API_ROOT_URL", "SAKURACLOUD_API_ROOT_URL"}, ""),
+		RetryMax:                       envvar.IntFromEnvMulti([]string{"SAKURA_RETRY_MAX", "SAKURACLOUD_RETRY_MAX"}, 0),
+		RetryWaitMax:                   envvar.IntFromEnvMulti([]string{"SAKURA_RETRY_WAIT_MAX", "SAKURACLOUD_RETRY_WAIT_MAX"}, 0),
+		RetryWaitMin:                   envvar.IntFromEnvMulti([]string{"SAKURA_RETRY_WAIT_MIN", "SAKURACLOUD_RETRY_WAIT_MIN"}, 0),
+		APIRequestTimeout:              envvar.IntFromEnvMulti([]string{"SAKURA_API_REQUEST_TIMEOUT", "SAKURACLOUD_API_REQUEST_TIMEOUT"}, 0),
+		APIRequestRateLimit:            envvar.IntFromEnvMulti([]string{"SAKURA_RATE_LIMIT", "SAKURACLOUD_RATE_LIMIT"}, 0),
+		Zones:                          envvar.StringSliceFromEnvMulti([]string{"SAKURA_ZONES", "SAKURACLOUD_ZONES"}, nil),
+		ServicePrincipalID:             envvar.StringFromEnvMulti([]string{"SAKURA_SERVICE_PRINCIPAL_ID", "SAKURACLOUD_SERVICE_PRINCIPAL_ID"}, ""),
+		ServicePrincipalKeyID:          envvar.StringFromEnvMulti([]string{"SAKURA_SERVICE_PRINCIPAL_KEY_ID", "SAKURACLOUD_SERVICE_PRINCIPAL_KEY_ID"}, ""),
+		ServicePrincipalPrivateKeyPath: envvar.StringFromEnvMulti([]string{"SAKURA_PRIVATE_KEY_PATH", "SAKURACLOUD_PRIVATE_KEY_PATH"}, ""),
 	}
 
 	var config sakuraProviderModel
@@ -184,20 +206,23 @@ func (p *sakuraProvider) Configure(ctx context.Context, req provider.ConfigureRe
 	}
 
 	cfg := common.Config{
-		Profile:             config.Profile.ValueString(),
-		AccessToken:         config.AccessToken.ValueString(),
-		AccessTokenSecret:   config.AccessTokenSecret.ValueString(),
-		Zone:                config.Zone.ValueString(),
-		DefaultZone:         config.DefaultZone.ValueString(),
-		APIRootURL:          config.APIRootURL.ValueString(),
-		RetryMax:            int(config.RetryMax.ValueInt32()),
-		RetryWaitMax:        int(config.RetryWaitMax.ValueInt64()),
-		RetryWaitMin:        int(config.RetryWaitMin.ValueInt64()),
-		APIRequestTimeout:   int(config.APIRequestTimeout.ValueInt64()),
-		APIRequestRateLimit: int(config.APIRequestRateLimit.ValueInt32()),
-		TraceMode:           config.TraceMode.ValueString(),
-		Zones:               common.TlistToStrings(config.Zones),
-		TerraformVersion:    req.TerraformVersion,
+		Profile:                        config.Profile.ValueString(),
+		AccessToken:                    config.AccessToken.ValueString(),
+		AccessTokenSecret:              config.AccessTokenSecret.ValueString(),
+		Zone:                           config.Zone.ValueString(),
+		DefaultZone:                    config.DefaultZone.ValueString(),
+		APIRootURL:                     config.APIRootURL.ValueString(),
+		RetryMax:                       int(config.RetryMax.ValueInt32()),
+		RetryWaitMax:                   int(config.RetryWaitMax.ValueInt64()),
+		RetryWaitMin:                   int(config.RetryWaitMin.ValueInt64()),
+		APIRequestTimeout:              int(config.APIRequestTimeout.ValueInt64()),
+		APIRequestRateLimit:            int(config.APIRequestRateLimit.ValueInt32()),
+		TraceMode:                      config.TraceMode.ValueString(),
+		Zones:                          common.TlistToStrings(config.Zones),
+		TerraformVersion:               req.TerraformVersion,
+		ServicePrincipalID:             config.ServicePrincipalID.ValueString(),
+		ServicePrincipalKeyID:          config.ServicePrincipalKeyID.ValueString(),
+		ServicePrincipalPrivateKeyPath: config.ServicePrincipalPrivateKeyPath.ValueString(),
 	}
 	// 他のパラメータとは違いプロファイルをロードするために、SAKURA_PROFILEの値だけは優先する
 	if cfg.Profile == "" {
@@ -205,6 +230,10 @@ func (p *sakuraProvider) Configure(ctx context.Context, req provider.ConfigureRe
 	}
 
 	var theClient saclient.Client
+	if err := theClient.SetEnviron(os.Environ()); err != nil {
+		resp.Diagnostics.AddError("Error creating Sakura client", err.Error())
+		return
+	}
 	if err := theClient.SettingsFromTerraformProvider(&config); err != nil {
 		resp.Diagnostics.AddError("Error creating Sakura client", err.Error())
 		return
@@ -214,6 +243,15 @@ func (p *sakuraProvider) Configure(ctx context.Context, req provider.ConfigureRe
 	if err != nil {
 		resp.Diagnostics.AddError("Error creating Sakura client", err.Error())
 		return
+	}
+
+	if cfg.HasBothAuthMethods() {
+		resp.Diagnostics.Append(diag.NewWarningDiagnostic(
+			"Both API key and Service Principal credentials are configured",
+			"When both authentication methods are set, saclient-go determines which to use. "+
+				"Consider removing one to make the authentication method explicit. "+
+				"EventBus always uses API key authentication regardless of this setting.",
+		))
 	}
 
 	p.client = client
@@ -352,15 +390,15 @@ func (p *sakuraProviderModel) LookupClientConfigProfileName() (string, bool) {
 }
 
 func (p *sakuraProviderModel) LookupClientConfigPrivateKeyPath() (string, bool) {
-	return "", false // :TODO: :TBW:
+	return p.ServicePrincipalPrivateKeyPath.ValueString(), !p.ServicePrincipalPrivateKeyPath.IsNull() && !p.ServicePrincipalPrivateKeyPath.IsUnknown()
 }
 
 func (p *sakuraProviderModel) LookupClientConfigServicePrincipalID() (string, bool) {
-	return "", false // :TODO: :TBW:
+	return p.ServicePrincipalID.ValueString(), !p.ServicePrincipalID.IsNull() && !p.ServicePrincipalID.IsUnknown()
 }
 
 func (p *sakuraProviderModel) LookupClientConfigServicePrincipalKeyID() (string, bool) {
-	return "", false // :TODO: :TBW:
+	return p.ServicePrincipalKeyID.ValueString(), !p.ServicePrincipalKeyID.IsNull() && !p.ServicePrincipalKeyID.IsUnknown()
 }
 
 func (p *sakuraProviderModel) LookupClientConfigAccessToken() (string, bool) {
