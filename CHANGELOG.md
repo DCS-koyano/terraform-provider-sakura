@@ -1,5 +1,7 @@
 # Changelog
 
+## [v3.12.3](https://github.com/DCS-koyano/terraform-provider-sakura/commits/v3.12.3) - 2026-06-24
+
 ## [v3.12.3](https://github.com/sacloud/terraform-provider-sakura/compare/v3.12.2...v3.12.3) - 2026-06-22
 
 - Use OndemandDB hostname from state in plan by @x-color in https://github.com/sacloud/terraform-provider-sakura/pull/267
