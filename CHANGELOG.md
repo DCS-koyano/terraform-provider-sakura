@@ -1,5 +1,7 @@
 # Changelog
 
+## [v3.14.3](https://github.com/DCS-koyano/terraform-provider-sakura/commits/v3.14.3) - 2026-10-19
+
 ## [v3.14.3](https://github.com/sacloud/terraform-provider-sakura/compare/v3.14.2...v3.14.3) - 2026-10-08
 
 ### Other Changes
